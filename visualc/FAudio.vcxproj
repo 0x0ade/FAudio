@@ -84,7 +84,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="..\..\FNA\lib\FAudio\src\FAudio_gstreamer.c" />
+    <ClCompile Include="..\src\FAudio_gstreamer.c" />
     <ClCompile Include="..\src\F3DAudio.c" />
     <ClCompile Include="..\src\FAudio.c" />
     <ClCompile Include="..\src\FAudio_internal.c" />
