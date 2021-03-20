@@ -31,23 +31,66 @@
 
 #include <gst/gst.h>
 #include <gst/audio/audio.h>
+#include <gst/app/gstappsrc.h>
 #include <gst/app/gstappsink.h>
+
+typedef struct FAudioGSTREAMERVoiceCallback
+{
+	FAUDIONAMELESS union
+	{
+		FAudioVoiceCallback;
+		FAudioVoiceCallback callback;
+	};
+	struct FAudioGSTREAMERPlayer *player;
+} FAudioGSTREAMERVoiceCallback;
+
+typedef enum FAudioGSTREAMERType
+{
+	FAUDIO_GSTREAMER_DECODER,
+	FAUDIO_GSTREAMER_PLAYER,
+} FAudioGSTREAMERType;
 
 typedef struct FAudioGSTREAMER
 {
-	GstPad *srcpad;
+	FAudioGSTREAMERType type;
 	GstElement *pipeline;
 	GstElement *dst;
 	GstElement *resampler;
 	GstSegment segment;
 	uint8_t *convertCache, *prevConvertCache;
 	size_t convertCacheLen, prevConvertCacheLen;
+} FAudioGSTREAMER;
+
+typedef struct FAudioGSTREAMERDecoder
+{
+	FAUDIONAMELESS union
+	{
+		FAudioGSTREAMER;
+		FAudioGSTREAMER gstreamer;
+	};
+	GstPad *srcpad;
 	uint32_t curBlock, prevBlock;
 	size_t *blockSizes;
 	uint32_t blockAlign;
 	uint32_t blockCount;
 	size_t maxBytes;
-} FAudioGSTREAMER;
+} FAudioGSTREAMERDecoder;
+
+typedef struct FAudioGSTREAMERPlayer
+{
+	FAUDIONAMELESS union
+	{
+		FAudioGSTREAMER;
+		FAudioGSTREAMER gstreamer;
+	};
+	FAudioSourceVoice *voice;
+	FAudio *audio;
+	FAudioIOStream *file;
+	FAudioGSTREAMERVoiceCallback callback;
+	GMutex readyMutex;
+	GCond readyCond;
+	GstPad *decodersrc;
+} FAudioGSTREAMERPlayer;
 
 #define SIZE_FROM_DST(sample) \
 	((sample) * voice->src.format->nChannels * sizeof(float))
@@ -66,19 +109,25 @@ typedef struct FAudioGSTREAMER
 
 static int FAudio_GSTREAMER_RestartDecoder(FAudioGSTREAMER *gstreamer)
 {
+	FAudioGSTREAMERDecoder *decoder;
 	GstEvent *event;
 
-	event = gst_event_new_flush_start();
-	gst_pad_push_event(gstreamer->srcpad, event);
+	if (gstreamer->type == FAUDIO_GSTREAMER_DECODER)
+	{
+		decoder = (FAudioGSTREAMERDecoder*) gstreamer;
 
-	event = gst_event_new_flush_stop(TRUE);
-	gst_pad_push_event(gstreamer->srcpad, event);
+		event = gst_event_new_flush_start();
+		gst_pad_push_event(decoder->srcpad, event);
 
-	event = gst_event_new_segment(&gstreamer->segment);
-	gst_pad_push_event(gstreamer->srcpad, event);
+		event = gst_event_new_flush_stop(TRUE);
+		gst_pad_push_event(decoder->srcpad, event);
 
-	gstreamer->curBlock = ~0u;
-	gstreamer->prevBlock = ~0u;
+		event = gst_event_new_segment(&gstreamer->segment);
+		gst_pad_push_event(decoder->srcpad, event);
+
+		decoder->curBlock = ~0u;
+		decoder->prevBlock = ~0u;
+	}
 
 	if (gst_element_set_state(gstreamer->pipeline, GST_STATE_PLAYING) == GST_STATE_CHANGE_FAILURE)
 	{
@@ -88,7 +137,7 @@ static int FAudio_GSTREAMER_RestartDecoder(FAudioGSTREAMER *gstreamer)
 	return 1;
 }
 
-static int FAudio_GSTREAMER_CheckForBusErrors(FAudioVoice *voice)
+static int FAudio_GSTREAMER_CheckForBusErrors(FAudio *audio, GstElement *pipeline)
 {
 	GstBus *bus;
 	GstMessage *msg;
@@ -96,7 +145,7 @@ static int FAudio_GSTREAMER_CheckForBusErrors(FAudioVoice *voice)
 	gchar *debug_info = NULL;
 	int ret = 0;
 
-	bus = gst_pipeline_get_bus(GST_PIPELINE(voice->src.gstreamer->pipeline));
+	bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
 
 	while((msg = gst_bus_pop_filtered(bus, GST_MESSAGE_ERROR)))
 	{
@@ -105,7 +154,7 @@ static int FAudio_GSTREAMER_CheckForBusErrors(FAudioVoice *voice)
 		case GST_MESSAGE_ERROR:
 			gst_message_parse_error(msg, &err, &debug_info);
 			LOG_ERROR(
-				voice->audio,
+				audio,
 				"Got gstreamer bus error from %s: %s (%s)",
 				GST_OBJECT_NAME(msg->src),
 				err->message,
@@ -138,16 +187,18 @@ static size_t FAudio_GSTREAMER_FillConvertCache(
 	size_t pulled, clipStartBytes, clipEndBytes, toCopyBytes;
 	GstAudioClippingMeta *cmeta;
 	GstFlowReturn push_ret;
+	FAudioGSTREAMERDecoder* gstreamer = (FAudioGSTREAMERDecoder*) voice->src.gstreamer;
+	FAudio_assert(gstreamer->type == FAUDIO_GSTREAMER_DECODER);
 
 	LOG_FUNC_ENTER(voice->audio)
 
 	/* Write current block to input buffer, push to pipeline */
 
 	clipStartBytes = (
-		(size_t) voice->src.gstreamer->blockAlign *
-		voice->src.gstreamer->curBlock
+		(size_t) gstreamer->blockAlign *
+		gstreamer->curBlock
 	);
-	toCopyBytes = voice->src.gstreamer->blockAlign;
+	toCopyBytes = gstreamer->blockAlign;
 	clipEndBytes = clipStartBytes + toCopyBytes;
 	if (buffer->AudioBytes < clipEndBytes)
 	{
@@ -185,8 +236,8 @@ static size_t FAudio_GSTREAMER_FillConvertCache(
 		return (size_t) -1;
 	}
 
-	push_ret = gst_pad_push(voice->src.gstreamer->srcpad, src);
-	if(	push_ret != GST_FLOW_OK &&
+	push_ret = gst_pad_push(gstreamer->srcpad, src);
+	if (	push_ret != GST_FLOW_OK &&
 		push_ret != GST_FLOW_EOS	)
 	{
 		LOG_ERROR(
@@ -258,9 +309,10 @@ static size_t FAudio_GSTREAMER_FillConvertCache(
 
 static int FAudio_GSTREAMER_DecodeBlock(FAudioVoice *voice, FAudioBuffer *buffer, uint32_t block, size_t availableBytes)
 {
-	FAudioGSTREAMER *gstreamer = voice->src.gstreamer;
+	FAudioGSTREAMERDecoder *gstreamer = (FAudioGSTREAMERDecoder*) voice->src.gstreamer;
 	uint8_t *tmpBuf;
 	size_t tmpLen;
+	FAudio_assert(gstreamer->type == FAUDIO_GSTREAMER_DECODER);
 
 	if (gstreamer->curBlock != ~0u && block != gstreamer->curBlock + 1)
 	{
@@ -276,7 +328,7 @@ static int FAudio_GSTREAMER_DecodeBlock(FAudioVoice *voice, FAudioBuffer *buffer
 			);
 		}
 		FAudio_assert(block == 0);
-		if (!FAudio_GSTREAMER_RestartDecoder(gstreamer))
+		if (!FAudio_GSTREAMER_RestartDecoder(&gstreamer->gstreamer))
 		{
 			LOG_WARNING(
 				voice->audio,
@@ -316,7 +368,8 @@ static void FAudio_INTERNAL_DecodeGSTREAMER(
 	uint32_t curBlock, curBufferOffset;
 	uint8_t *convertCache;
 	int error = 0;
-	FAudioGSTREAMER *gstreamer = voice->src.gstreamer;
+	FAudioGSTREAMERDecoder *gstreamer = (FAudioGSTREAMERDecoder*) voice->src.gstreamer;
+	FAudio_assert(gstreamer->type == FAUDIO_GSTREAMER_DECODER);
 
 	if (gstreamer->blockCount != 0)
 	{
@@ -421,7 +474,7 @@ decode:
 	curBufferOffset += SAMPLES_FROM_DST(siz);
 
 done:
-	if (FAudio_GSTREAMER_CheckForBusErrors(voice))
+	if (FAudio_GSTREAMER_CheckForBusErrors(voice->audio, voice->src.gstreamer->pipeline))
 	{
 		LOG_ERROR(
 			voice->audio,
@@ -449,7 +502,12 @@ done:
 
 void FAudio_GSTREAMER_end_buffer(FAudioSourceVoice *pSourceVoice)
 {
-	FAudioGSTREAMER *gstreamer = pSourceVoice->src.gstreamer;
+	if (pSourceVoice->src.gstreamer->type != FAUDIO_GSTREAMER_DECODER)
+	{
+		return;
+	}
+
+	FAudioGSTREAMERDecoder *gstreamer = (FAudioGSTREAMERDecoder*) pSourceVoice->src.gstreamer;
 
 	LOG_FUNC_ENTER(pSourceVoice->audio)
 
@@ -460,6 +518,103 @@ void FAudio_GSTREAMER_end_buffer(FAudioSourceVoice *pSourceVoice)
 	gstreamer->prevBlock = ~0u;
 
 	LOG_FUNC_EXIT(pSourceVoice->audio)
+}
+
+static void FAudio_GSTREAMER_SongSubmitBuffer(FAudioVoiceCallback *callback, void *pBufferContext)
+{
+	GstBuffer *dst;
+	GstSample *sample;
+	GstMapInfo info;
+	size_t pulled, clipStartBytes, clipEndBytes, toCopyBytes;
+	GstAudioClippingMeta *cmeta;
+	FAudioBuffer buffer;
+	GstState state, statePending;
+	FAudioGSTREAMERVoiceCallback *c = (FAudioGSTREAMERVoiceCallback*) callback;
+	int ended = 0;
+	FAudioSourceVoice *voice = c->player->voice;
+
+	LOG_FUNC_ENTER(c->player->audio)
+
+	if (	gst_element_get_state(c->player->pipeline, &state, &statePending, 1 * GST_SECOND) == GST_STATE_CHANGE_FAILURE ||
+		state != GST_STATE_PLAYING	)
+	{
+		ended = 1;
+	}
+
+	pulled = 0;
+	do {
+		/* Pull frames one into cache */
+		sample = gst_app_sink_try_pull_sample(
+			GST_APP_SINK(c->player->dst),
+			0
+		);
+
+		if (!sample)
+		{
+			/* done decoding */
+			break;
+		}
+		dst = gst_sample_get_buffer(sample);
+		gst_buffer_map(dst, &info, GST_MAP_READ);
+
+		cmeta = gst_buffer_get_audio_clipping_meta(dst);
+		if (cmeta)
+		{
+			FAudio_assert(cmeta->format == GST_FORMAT_DEFAULT /* == samples */);
+			clipStartBytes = SIZE_FROM_DST(cmeta->start);
+			clipEndBytes = SIZE_FROM_DST(cmeta->end);
+		}
+		else
+		{
+			clipStartBytes = 0;
+			clipEndBytes = 0;
+		}
+
+		toCopyBytes = info.size - (clipStartBytes + clipEndBytes);
+
+		if (c->player->convertCacheLen < pulled + toCopyBytes)
+		{
+			c->player->convertCacheLen = pulled + toCopyBytes;
+			c->player->convertCache = (uint8_t*) c->player->audio->pRealloc(
+				c->player->convertCache,
+				pulled + toCopyBytes
+			);
+		}
+
+
+		FAudio_memcpy(c->player->convertCache + pulled,
+			info.data + clipStartBytes,
+			toCopyBytes
+		);
+
+		gst_buffer_unmap(dst, &info);
+		gst_sample_unref(sample);
+
+		pulled += toCopyBytes;
+		/* FIXME: Do we want to pull in everything we can at the end? Might introduce a hitch at the end. */
+	} while (ended);
+
+	if (!ended && pulled)
+	{
+		buffer.Flags = ended ?
+			FAUDIO_END_OF_STREAM :
+			0;
+		buffer.AudioBytes = pulled;
+		buffer.pAudioData = c->player->convertCache;
+		buffer.PlayBegin = 0;
+		buffer.PlayLength = pulled / voice->src.format->nChannels / sizeof(float);
+		buffer.LoopBegin = 0;
+		buffer.LoopLength = 0;
+		buffer.LoopCount = 0;
+		buffer.pContext = NULL;
+		FAudioSourceVoice_SubmitSourceBuffer(
+			voice,
+			&buffer,
+			NULL
+		);
+	}
+
+	LOG_FUNC_EXIT(c->player->audio)
 }
 
 static void FAudio_GSTREAMER_NewDecodebinPad(GstElement *decodebin,
@@ -478,6 +633,115 @@ static void FAudio_GSTREAMER_NewDecodebinPad(GstElement *decodebin,
 	gst_pad_link(pad, ac_sink);
 
 	gst_object_unref(ac_sink);
+
+	if (gstreamer->type == FAUDIO_GSTREAMER_PLAYER)
+	{
+		FAudioGSTREAMERPlayer *player = (FAudioGSTREAMERPlayer*) gstreamer;
+		g_mutex_lock(&player->readyMutex);
+		player->decodersrc = pad;
+		g_cond_broadcast(&player->readyCond);
+		g_mutex_unlock(&player->readyMutex);
+	}
+}
+
+static void FAudio_GSTREAMER_NeedData(
+	GstElement *appsrc,
+	guint length,
+	gpointer user
+) {
+	GstFlowReturn flow_ret;
+	GstBuffer *buffer;
+	GstMapInfo info;
+	FAudioGSTREAMERPlayer* gstreamer = user;
+
+	/* The docs mention listening to enough-data but the docs also want a main loop.
+	 * Let's trust length.
+	 */
+	if (length == -1)
+	{
+		length = 1024 * 8;
+	}
+
+	buffer = gst_buffer_new_and_alloc(length);
+	gst_buffer_map(buffer, &info, GST_MAP_WRITE);
+	if (gstreamer->file->read(gstreamer->file->data, info.data, length, 1))
+	{
+		gst_buffer_unmap(buffer, &info);
+		g_signal_emit_by_name(appsrc, "push-buffer", buffer, &flow_ret);
+		gst_buffer_unref(buffer);
+	}
+	else
+	{
+		gst_buffer_unmap(buffer, &info);
+		gst_buffer_unref(buffer);
+		g_signal_emit_by_name(appsrc, "end-of-stream", &flow_ret);
+	}
+
+	if (	flow_ret != GST_FLOW_OK &&
+		flow_ret != GST_FLOW_EOS	)
+	{
+		LOG_ERROR(
+			gstreamer->audio,
+			"for song %p, pushing buffer failed: 0x%x",
+			gstreamer->voice,
+			flow_ret
+		);
+		return;
+	}
+}
+
+static gboolean FAudio_GSTREAMER_SeekData(
+	GstElement *appsrc,
+	guint64 offset,
+	gpointer user
+) {
+	FAudioGSTREAMERPlayer* gstreamer = user;
+	return gstreamer->file->seek(gstreamer->file->data, offset, FAUDIO_SEEK_SET) == offset;
+}
+
+static void FAudio_GSTREAMER_SourceSetup(
+	GstElement *uridecodebin,
+	GstElement *source,
+	gpointer user
+) {
+	GstPad *srcpad;
+	int64_t size;
+	FAudioGSTREAMERPlayer* gstreamer = user;
+
+	size = gstreamer->file->seek(gstreamer->file->data, 0, FAUDIO_SEEK_END);
+	gstreamer->file->seek(gstreamer->file->data, 0, FAUDIO_SEEK_SET);
+
+	g_object_set(G_OBJECT(source),
+		"stream-type",	GST_APP_STREAM_TYPE_RANDOM_ACCESS,
+		"format",	GST_FORMAT_BYTES,
+		"is-live",	TRUE,
+		"size",		size,
+		NULL
+	);
+	g_signal_connect(source, "need-data", G_CALLBACK(FAudio_GSTREAMER_NeedData), user);
+	g_signal_connect(source, "seek-data", G_CALLBACK(FAudio_GSTREAMER_SeekData), user);
+
+	srcpad = gst_element_get_static_pad(source, "src");
+	if (!srcpad)
+	{
+		LOG_ERROR(
+			gstreamer->audio,
+			"%s",
+			"Unable to obtain srcpad"
+		)
+	}
+	else
+	{
+		if (!gst_pad_set_active(srcpad, TRUE))
+		{
+			LOG_ERROR(
+				gstreamer->audio,
+				"%s",
+				"Unable to activate srcpad"
+			)
+		}
+		gst_object_unref(srcpad);
+	}
 }
 
 /* XMA2 doesn't have a recognized mimetype and so far only libav's avdec_xma2 exists for XMA2.
@@ -533,7 +797,7 @@ static GValueArray *FAudio_GSTREAMER_XMA2_DecodebinAutoplugFactories(
 
 uint32_t FAudio_GSTREAMER_init(FAudioSourceVoice *pSourceVoice, uint32_t type)
 {
-	FAudioGSTREAMER *result;
+	FAudioGSTREAMERDecoder *result;
 	GstElement *decoder = NULL, *converter = NULL;
 	const GList *tmpls;
 	GstStaticPadTemplate *tmpl;
@@ -612,13 +876,14 @@ uint32_t FAudio_GSTREAMER_init(FAudioSourceVoice *pSourceVoice, uint32_t type)
 		return FAUDIO_E_UNSUPPORTED_FORMAT;
 	}
 
+	result = (FAudioGSTREAMERDecoder*) pSourceVoice->audio->pMalloc(sizeof(FAudioGSTREAMERDecoder));
+	FAudio_zero(result, sizeof(FAudioGSTREAMERDecoder));
+	result->type = FAUDIO_GSTREAMER_DECODER;
+
 	/* Set up the GStreamer pipeline.
 	 * Note that we're not assigning names, since many pipelines will exist
 	 * at the same time (one per source voice).
 	 */
-	result = (FAudioGSTREAMER*) pSourceVoice->audio->pMalloc(sizeof(FAudioGSTREAMER));
-	FAudio_zero(result, sizeof(FAudioGSTREAMER));
-
 	result->pipeline = gst_pipeline_new(NULL);
 
 	decoder = gst_element_factory_make("decodebin", NULL);
@@ -804,7 +1069,7 @@ uint32_t FAudio_GSTREAMER_init(FAudioSourceVoice *pSourceVoice, uint32_t type)
 
 	gst_segment_init(&result->segment, GST_FORMAT_TIME);
 
-	if (!FAudio_GSTREAMER_RestartDecoder(result))
+	if (!FAudio_GSTREAMER_RestartDecoder(&result->gstreamer))
 	{
 		LOG_ERROR(
 			pSourceVoice->audio,
@@ -814,10 +1079,10 @@ uint32_t FAudio_GSTREAMER_init(FAudioSourceVoice *pSourceVoice, uint32_t type)
 		goto free_with_bin;
 	}
 
-	pSourceVoice->src.gstreamer = result;
+	pSourceVoice->src.gstreamer = &result->gstreamer;
 	pSourceVoice->src.decode = FAudio_INTERNAL_DecodeGSTREAMER;
 
-	if (FAudio_GSTREAMER_CheckForBusErrors(pSourceVoice))
+	if (FAudio_GSTREAMER_CheckForBusErrors(pSourceVoice->audio, pSourceVoice->src.gstreamer->pipeline))
 	{
 		LOG_ERROR(
 			pSourceVoice->audio,
@@ -871,15 +1136,354 @@ free_with_bin:
 	return FAUDIO_E_UNSUPPORTED_FORMAT;
 }
 
+float FAudio_GSTREAMER_play(FAudio *audio, FAudioSourceVoice **ppSourceVoice, const char* name)
+{
+	FAudioGSTREAMERPlayer *result;
+	GstElement *decoder = NULL, *converter = NULL;
+	FAudioWaveFormatEx format;
+	gint64 duration;
+	GstPad *pad;
+	GstCaps *caps;
+	GstStructure *capstruct;
+	gint channels;
+
+	/* FIXME: Merge FAudio_GSTREAMER_init and FAudio_GSTREAMER_play common code!
+	 * A lot of the boilerplate setup / teardown code here is copied from _init.
+	 * It might be worth it to have dedicated setup / teardown functions.
+	 * For now though, let's get this up and running.
+	 * Code reviewers, if you're seeing this: PLEASE REMIND ME ABOUT THIS!
+	 * -ade
+	 */
+
+	LOG_FUNC_ENTER(audio)
+
+	/* Init GStreamer statically. The docs tell us not to exit, so I guess
+	 * we're supposed to just leak!
+	 */
+	if (!gst_is_initialized())
+	{
+		/* Apparently they ask for this to leak... */
+		gst_init(NULL, NULL);
+	}
+
+	result = (FAudioGSTREAMERPlayer*) audio->pMalloc(sizeof(FAudioGSTREAMERPlayer));
+	FAudio_zero(result, sizeof(FAudioGSTREAMERPlayer));
+	result->type = FAUDIO_GSTREAMER_PLAYER;
+	result->audio = audio;
+
+	g_mutex_init(&result->readyMutex);
+	g_cond_init(&result->readyCond);
+	result->decodersrc = NULL;
+
+	/* FIXME: XNA supports playing songs over the network... why the fuck. */
+	result->file = FAudio_fopen(name);
+	if (!result->file)
+	{
+		LOG_ERROR(
+			audio,
+			"Unable to open file: %s",
+			name
+		)
+		goto free_without_bin;
+	}
+
+	/* Set up the GStreamer pipeline.
+	 * Note that we're not assigning names, since many pipelines will exist
+	 * at the same time (one per source voice).
+	 */
+	result->pipeline = gst_pipeline_new(NULL);
+
+	decoder = gst_element_factory_make("uridecodebin", NULL);
+	if (!decoder)
+	{
+		LOG_ERROR(
+			audio,
+			"Unable to create gstreamer uridecodebin; is %zu-bit gst-plugins-base installed?",
+			sizeof(void*) * 8
+		)
+		goto free_without_bin;
+	}
+
+	g_object_set(G_OBJECT(decoder), "uri", "appsrc://", NULL);
+	g_signal_connect(decoder, "source-setup", G_CALLBACK(FAudio_GSTREAMER_SourceSetup), result);
+	g_signal_connect(decoder, "pad-added", G_CALLBACK(FAudio_GSTREAMER_NewDecodebinPad), result);
+
+	result->resampler = gst_element_factory_make("audioresample", NULL);
+	if (!result->resampler)
+	{
+		LOG_ERROR(
+			audio,
+			"Unable to create gstreamer audioresample; is %zu-bit gst-plugins-base installed?",
+			sizeof(void *) * 8
+		)
+		goto free_without_bin;
+	}
+
+	converter = gst_element_factory_make("audioconvert", NULL);
+	if (!converter)
+	{
+		LOG_ERROR(
+			audio,
+			"Unable to create gstreamer audioconvert; is %zu-bit gst-plugins-base installed?",
+			sizeof(void *) * 8
+		)
+		goto free_without_bin;
+	}
+
+	result->dst = gst_element_factory_make("appsink", NULL);
+	if (!result->dst)
+	{
+		LOG_ERROR(
+			audio,
+			"Unable to create gstreamer appsink; is %zu-bit gst-plugins-base installed?",
+			sizeof(void *) * 8
+		)
+		goto free_without_bin;
+	}
+
+	/* turn off sync so we can pull data without waiting for it to "play" in realtime */
+	g_object_set(G_OBJECT(result->dst), "sync", FALSE, "async", TRUE, NULL);
+
+	/* Compile the pipeline, finally. */
+	gst_bin_add_many(
+		GST_BIN(result->pipeline),
+		decoder,
+		result->resampler,
+		converter,
+		result->dst,
+		NULL
+	);
+
+	if (!gst_element_link_many(
+		result->resampler,
+		converter,
+		result->dst,
+		NULL))
+	{
+		LOG_ERROR(
+			audio,
+			"%s",
+			"Unable to get link pipeline"
+		)
+		goto free_with_bin;
+	}
+
+	/* Start the stream */
+	gst_segment_init(&result->segment, GST_FORMAT_TIME);
+
+	if (!FAudio_GSTREAMER_RestartDecoder(&result->gstreamer))
+	{
+		LOG_ERROR(
+			audio,
+			"%s",
+			"Starting decoder failed!"
+		)
+		goto free_with_bin;
+	}
+
+	if (FAudio_GSTREAMER_CheckForBusErrors(audio, result->pipeline))
+	{
+		LOG_ERROR(
+			audio,
+			"%s",
+			"Got a bus error after creation!"
+		)
+		goto free_with_bin;
+	}
+
+	/* XNA blocks until the song plays. We MUST do the same as we wait for the duration.
+	 * NO ONE ON EARTH SHOULD BE USING THE XNA SONG API WITH NETWORKED RESOURCES... but it's allowed.
+	 * IF YOU'RE READING THIS AND PLAYING SONGS VIA NON-FILE PROTOCOLS: WHAT'S WRONG WITH YOU?!
+	 * -ade
+	 */
+
+	/* Let's add some sanity into this hellish place by adding a timeout.
+	 * This timeout can also get reached when initializing the decoder takes too long.
+	 * If your toaster manages to be slow enough to reach it in that case, good job!
+	 */
+	g_mutex_lock(&result->readyMutex);
+	duration = g_get_monotonic_time() + 30 * G_TIME_SPAN_SECOND;
+	while (!result->decodersrc)
+	{
+		if (!g_cond_wait_until(&result->readyCond, &result->readyMutex, duration))
+		{
+			/* Let's waste time. */
+		}
+	}
+	g_mutex_unlock(&result->readyMutex);
+
+	if (!result->decodersrc)
+	{
+		LOG_ERROR(
+			audio,
+			"%s",
+			"Decoder took way too long to initialize!"
+		)
+		goto free_with_bin;
+	}
+
+	/* Obtain the output caps and apply them to the destination pad and voice format. */
+	pad = gst_element_get_static_pad(result->resampler, "sink");
+	caps = gst_pad_get_current_caps(result->decodersrc);
+	capstruct = gst_caps_get_structure(caps, 0);
+	/* FIXME: Merge XNA_Song vorbis and gstreamer source voice common code!
+	 * Similar to the above note about _init and _play (if said note still exists),
+	 * most of the source voice creation code here is copied from XNA_PlaySong.
+	 * It might be worth it to revisit what exactly this function should "return".
+	 * For now though, let's get this up and running.
+	 * Code reviewers, if you're seeing this: PLEASE REMIND ME ABOUT THIS!
+	 * -ade
+	 */
+	format.wFormatTag = FAUDIO_FORMAT_IEEE_FLOAT;
+	if (!gst_structure_get_int(capstruct, "channels", &channels))
+	{
+		capstruct = NULL;
+		gst_caps_unref(caps);
+		LOG_ERROR(
+			audio,
+			"%s",
+			"Couldn't obtain channel count!"
+		)
+		goto free_with_bin;
+	}
+	format.nChannels = channels;
+	if (!gst_structure_get_int(capstruct, "rate", &format.nSamplesPerSec))
+	{
+		capstruct = NULL;
+		gst_caps_unref(caps);
+		LOG_ERROR(
+			audio,
+			"%s",
+			"Couldn't obtain sample rate!"
+		)
+		goto free_with_bin;
+	}
+	format.wBitsPerSample = sizeof(float) * 8;
+	format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
+	format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+	format.cbSize = 0;
+	capstruct = NULL;
+	gst_caps_unref(caps);
+
+	caps = gst_caps_new_simple(
+		"audio/x-raw",
+		"format",	G_TYPE_STRING, gst_audio_format_to_string(GST_AUDIO_FORMAT_F32),
+		"layout",	G_TYPE_STRING, "interleaved",
+		"channels",	G_TYPE_INT, format.nChannels,
+		"rate",		G_TYPE_INT, format.nSamplesPerSec,
+		NULL
+	);
+	gst_app_sink_set_caps(GST_APP_SINK(result->dst), caps);
+	gst_caps_unref(caps);
+
+	// GST_DEBUG_BIN_TO_DOT_FILE_WITH_TS(GST_BIN(result->pipeline), GST_DEBUG_GRAPH_SHOW_ALL, "helpme");
+
+	/* Init voice */
+	FAudio_zero(&result->callback, sizeof(FAudioGSTREAMERVoiceCallback));
+	result->callback.player = result;
+	result->callback.OnBufferEnd = FAudio_GSTREAMER_SongSubmitBuffer;
+	FAudio_CreateSourceVoice(
+		audio,
+		ppSourceVoice,
+		&format,
+		0,
+		1.0f, /* No pitch shifting here! */
+		&result->callback.callback,
+		NULL,
+		NULL
+	);
+
+	result->voice = *ppSourceVoice;
+
+	(*ppSourceVoice)->src.gstreamer = &result->gstreamer;
+
+	if (!gst_element_query_duration(result->pipeline, GST_FORMAT_TIME, &duration))
+	{
+		LOG_ERROR(
+			audio,
+			"%s",
+			"Couldn't obtain duration!"
+		)
+		goto free_with_bin;
+	}
+
+	/* The decoder is already active, let's start pushing the first few samples. */
+	FAudio_GSTREAMER_SongSubmitBuffer(&result->callback.callback, NULL);
+
+	LOG_FUNC_EXIT(audio)
+	return GST_TIME_AS_MSECONDS(duration) / 1000.0f;
+
+free_without_bin:
+	if (result->dst)
+	{
+		gst_object_unref(result->dst);
+	}
+	if (converter)
+	{
+		gst_object_unref(converter);
+	}
+	if (result->resampler)
+	{
+		gst_object_unref(result->resampler);
+	}
+	if (decoder)
+	{
+		gst_object_unref(decoder);
+	}
+	if (result->pipeline)
+	{
+		gst_object_unref(result->pipeline);
+	}
+	if (result->file)
+	{
+		FAudio_close(result->file);
+	}
+	g_mutex_clear(&result->readyMutex);
+	g_cond_clear(&result->readyCond);
+	audio->pFree(result);
+	*ppSourceVoice = NULL;
+	LOG_FUNC_EXIT(audio)
+	return 0.0f;
+
+free_with_bin:
+	gst_object_unref(result->pipeline);
+	if (result->file)
+	{
+		FAudio_close(result->file);
+	}
+	g_mutex_clear(&result->readyMutex);
+	g_cond_clear(&result->readyCond);
+	audio->pFree(result);
+	*ppSourceVoice = NULL;
+	LOG_FUNC_EXIT(audio)
+	return 0.0f;
+}
+
+
 void FAudio_GSTREAMER_free(FAudioSourceVoice *voice)
 {
 	LOG_FUNC_ENTER(voice->audio)
 	gst_element_set_state(voice->src.gstreamer->pipeline, GST_STATE_NULL);
 	gst_object_unref(voice->src.gstreamer->pipeline);
-	gst_object_unref(voice->src.gstreamer->srcpad);
 	voice->audio->pFree(voice->src.gstreamer->convertCache);
 	voice->audio->pFree(voice->src.gstreamer->prevConvertCache);
-	voice->audio->pFree(voice->src.gstreamer->blockSizes);
+	if (voice->src.gstreamer->type == FAUDIO_GSTREAMER_DECODER)
+	{
+		FAudioGSTREAMERDecoder *gstreamer = (FAudioGSTREAMERDecoder*) voice->src.gstreamer;
+		gst_object_unref(gstreamer->srcpad);
+		voice->audio->pFree(gstreamer->blockSizes);
+	}
+	else if (voice->src.gstreamer->type == FAUDIO_GSTREAMER_PLAYER)
+	{
+		FAudioGSTREAMERPlayer *player = (FAudioGSTREAMERPlayer*) voice->src.gstreamer;
+		FAudio_close(player->file);
+		g_mutex_clear(&player->readyMutex);
+		g_cond_clear(&player->readyCond);
+	}
+	else
+	{
+		FAudio_assert(0 && "Unknown GStreamer type!");
+	}
 	voice->audio->pFree(voice->src.gstreamer);
 	voice->src.gstreamer = NULL;
 	LOG_FUNC_EXIT(voice->audio)

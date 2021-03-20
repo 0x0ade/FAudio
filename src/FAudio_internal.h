@@ -736,6 +736,7 @@ DECODE_FUNC(WMAERROR)
 
 #ifdef HAVE_GSTREAMER
 uint32_t FAudio_GSTREAMER_init(FAudioSourceVoice *pSourceVoice, uint32_t type);
+float FAudio_GSTREAMER_play(FAudio *audio, FAudioSourceVoice **ppSourceVoice, const char *name);
 void FAudio_GSTREAMER_free(FAudioSourceVoice *voice);
 void FAudio_GSTREAMER_end_buffer(FAudioSourceVoice *voice);
 #endif /* HAVE_GSTREAMER */

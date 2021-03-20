@@ -80,6 +80,13 @@
 #define STB_VORBIS_NO_INTEGER_CONVERSION 1
 #include "stb_vorbis.h"
 
+#ifdef HAVE_GSTREAMER
+#include <gst/gst.h>
+#include <gst/audio/audio.h>
+#include <gst/app/gstappsrc.h>
+#include <gst/app/gstappsink.h>
+#endif /* HAVE_GSTREAMER */
+
 /* Globals */
 
 static float songVolume = 1.0f;
@@ -88,8 +95,31 @@ static FAudioMasteringVoice *songMaster = NULL;
 
 static FAudioSourceVoice *songVoice = NULL;
 static FAudioVoiceCallback callbacks;
-static stb_vorbis *activeSong = NULL;
-static stb_vorbis_info activeSongInfo;
+
+/* How nice of stb_vorbis to define a struct that we can use for all formats... */
+static stb_vorbis_info activeVorbisInfo;
+
+static stb_vorbis *activeVorbis = NULL;
+
+#ifdef HAVE_GSTREAMER
+typedef struct XNASongGSTREAMER {
+	GstPad* srcpad;
+	GstElement* pipeline;
+	GstElement* dst;
+	GstElement* resampler;
+	GstSegment segment;
+	uint8_t* convertCache, * prevConvertCache;
+	size_t convertCacheLen, prevConvertCacheLen;
+	uint32_t curBlock, prevBlock;
+	size_t* blockSizes;
+	uint32_t blockAlign;
+	uint32_t blockCount;
+	size_t maxBytes;
+} XNASongGSTREAMER;
+
+static XNASongGSTREAMER *activeGStreamer;
+#endif /* HAVE_GSTREAMER */
+
 static uint8_t *songCache;
 
 /* Internal Functions */
@@ -98,19 +128,19 @@ static void XNA_SongSubmitBuffer(FAudioVoiceCallback *callback, void *pBufferCon
 {
 	FAudioBuffer buffer;
 	uint32_t decoded = stb_vorbis_get_samples_float_interleaved(
-		activeSong,
-		activeSongInfo.channels,
+		activeVorbis,
+		activeVorbisInfo.channels,
 		(float*) songCache,
-		activeSongInfo.sample_rate * activeSongInfo.channels
+		activeVorbisInfo.sample_rate * activeVorbisInfo.channels
 	);
 	if (decoded == 0)
 	{
 		return;
 	}
-	buffer.Flags = (decoded < activeSongInfo.sample_rate) ?
+	buffer.Flags = (decoded < activeVorbisInfo.sample_rate) ?
 		FAUDIO_END_OF_STREAM :
 		0;
-	buffer.AudioBytes = decoded * activeSongInfo.channels * sizeof(float);
+	buffer.AudioBytes = decoded * activeVorbisInfo.channels * sizeof(float);
 	buffer.pAudioData = songCache;
 	buffer.PlayBegin = 0;
 	buffer.PlayLength = decoded;
@@ -129,6 +159,12 @@ static void XNA_SongKill()
 {
 	if (songVoice != NULL)
 	{
+#ifdef HAVE_GSTREAMER
+		if (songVoice->src.gstreamer)
+		{
+			FAudio_GSTREAMER_free(songVoice);
+		}
+#endif /* HAVE_GSTREAMER */
 		FAudioSourceVoice_Stop(songVoice, 0, 0);
 		FAudioVoice_DestroyVoice(songVoice);
 		songVoice = NULL;
@@ -138,10 +174,10 @@ static void XNA_SongKill()
 		FAudio_free(songCache);
 		songCache = NULL;
 	}
-	if (activeSong != NULL)
+	if (activeVorbis != NULL)
 	{
-		stb_vorbis_close(activeSong);
-		activeSong = NULL;
+		stb_vorbis_close(activeVorbis);
+		activeVorbis = NULL;
 	}
 }
 
@@ -171,45 +207,70 @@ FAUDIOAPI void XNA_SongQuit()
 FAUDIOAPI float XNA_PlaySong(const char *name)
 {
 	FAudioWaveFormatEx format;
+	size_t namelength;
+	float duration;
+
 	XNA_SongKill();
 
-	activeSong = stb_vorbis_open_filename(name, NULL, NULL);
+	namelength = FAudio_strlen(name);
+	if (	namelength >= 4 && (
+		FAudio_strcmp(name + namelength - 4, ".ogg") == 0 ||
+		FAudio_strcmp(name + namelength - 4, ".oga") == 0)	)
+	{
+		activeVorbis = stb_vorbis_open_filename(name, NULL, NULL);
 
-	/* Set format info */
-	activeSongInfo = stb_vorbis_get_info(activeSong);
-	format.wFormatTag = FAUDIO_FORMAT_IEEE_FLOAT;
-	format.nChannels = activeSongInfo.channels;
-	format.nSamplesPerSec = activeSongInfo.sample_rate;
-	format.wBitsPerSample = sizeof(float) * 8;
-	format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
-	format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
-	format.cbSize = 0;
+		/* Set format info */
+		activeVorbisInfo = stb_vorbis_get_info(activeVorbis);
+		format.wFormatTag = FAUDIO_FORMAT_IEEE_FLOAT;
+		format.nChannels = activeVorbisInfo.channels;
+		format.nSamplesPerSec = activeVorbisInfo.sample_rate;
+		format.wBitsPerSample = sizeof(float) * 8;
+		format.nBlockAlign = format.nChannels * format.wBitsPerSample / 8;
+		format.nAvgBytesPerSec = format.nSamplesPerSec * format.nBlockAlign;
+		format.cbSize = 0;
 
-	/* Allocate decode cache */
-	songCache = (uint8_t*) FAudio_malloc(format.nAvgBytesPerSec);
+		/* Init voice */
+		FAudio_zero(&callbacks, sizeof(FAudioVoiceCallback));
+		callbacks.OnBufferEnd = XNA_SongSubmitBuffer;
+		FAudio_CreateSourceVoice(
+			songAudio,
+			&songVoice,
+			&format,
+			0,
+			1.0f, /* No pitch shifting here! */
+			&callbacks,
+			NULL,
+			NULL
+		);
 
-	/* Init voice */
-	FAudio_zero(&callbacks, sizeof(FAudioVoiceCallback));
-	callbacks.OnBufferEnd = XNA_SongSubmitBuffer;
-	FAudio_CreateSourceVoice(
-		songAudio,
-		&songVoice,
-		&format,
-		0,
-		1.0f, /* No pitch shifting here! */
-		&callbacks,
-		NULL,
-		NULL
-	);
+		/* Allocate decode cache */
+		songCache = (uint8_t*) FAudio_malloc(format.nAvgBytesPerSec);
+
+		/* Okay, this song is decoding now */
+		stb_vorbis_seek_start(activeVorbis);
+		XNA_SongSubmitBuffer(NULL, NULL);
+
+		/* Finally. */
+		duration = stb_vorbis_stream_length_in_seconds(activeVorbis);
+	}
+	else
+	{
+		activeVorbis = NULL;
+#ifdef HAVE_GSTREAMER
+		duration = FAudio_GSTREAMER_play(songAudio, &songVoice, name, songVolume);
+		if (duration <= 0.0f || songVoice == NULL)
+		{
+			return 0.0f;
+		}
+#else
+		FAudio_assert(0 && "Unsupported song file format!");
+		return 0.0f;
+#endif /* HAVE_GSTREAMER */
+	}
+
 	FAudioVoice_SetVolume(songVoice, songVolume, 0);
-
-	/* Okay, this song is decoding now */
-	stb_vorbis_seek_start(activeSong);
-	XNA_SongSubmitBuffer(NULL, NULL);
-
-	/* Finally. */
 	FAudioSourceVoice_Start(songVoice, 0, 0);
-	return stb_vorbis_stream_length_in_seconds(activeSong);
+	return duration;
 }
 
 FAUDIOAPI void XNA_PauseSong()
@@ -247,10 +308,11 @@ FAUDIOAPI void XNA_SetSongVolume(float volume)
 FAUDIOAPI uint32_t XNA_GetSongEnded()
 {
 	FAudioVoiceState state;
-	if (songVoice == NULL || activeSong == NULL)
+	if (songVoice == NULL)
 	{
 		return 1;
 	}
+	/* FIXME: Handle starvation, waiting for new samples and GStreamer state. */
 	FAudioSourceVoice_GetState(songVoice, &state, 0);
 	return state.BuffersQueued == 0;
 }
